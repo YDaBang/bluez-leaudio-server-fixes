@@ -1,0 +1,8 @@
+The patches in this repository modify BlueZ and are offered under the same
+license as BlueZ itself: GNU General Public License version 2 or later.
+
+BlueZ is Copyright (C) 2000-2001 Qualcomm Incorporated, 2002-2003 Maxim
+Krasnyansky, 2002-2010 Marcel Holtmann, and others.  See the upstream
+COPYING file for the full text and the complete list of copyright holders.
+
+    https://git.kernel.org/pub/scm/bluetooth/bluez.git

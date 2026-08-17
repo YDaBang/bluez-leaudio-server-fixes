@@ -1,0 +1,289 @@
+From: YDaBang <y_dabang@protonmail.com>
+Date: Sun, 16 Aug 2026 12:25:00 +0900
+Subject: [PATCH] shared/bap: validate assigned Generic Audio metadata
+
+Android includes the standard CCID List metadata entry when enabling a
+conversational unicast ASE. BlueZ recognizes only types 0x01 through 0x04 and
+therefore rejects that valid request before transport acquisition.
+
+Recognize every Generic Audio Metadata type currently assigned by Bluetooth
+SIG. Validate fixed-size fields and the structural minimums for variable-size
+fields, accept the zero-value Immediate Rendering flag, and continue to reject
+RFU types. This also fixes the existing missing length checks for Preferred
+Audio Contexts and Language.
+
+Add server tests for the exact Android CCID payload, a valid set containing
+all assigned types, malformed values at each new structural boundary, and a
+genuinely RFU type (0x7f).
+---
+
+Signed-off-by: YDaBang <y_dabang@protonmail.com>
+
+--- a/src/shared/bap.c
++++ b/src/shared/bap.c
+@@ -64,6 +64,15 @@
+ #define BAP_METADATA_CONTEXT_LTV_TYPE		0x02
+ #define BAP_METADATA_PROGRAM_INFO_LTV_TYPE	0x03
+ #define BAP_METADATA_LANGUAGE_LTV_TYPE		0x04
++#define BAP_METADATA_CCID_LIST_LTV_TYPE		0x05
++#define BAP_METADATA_PARENTAL_RATING_LTV_TYPE	0x06
++#define BAP_METADATA_PROGRAM_INFO_URI_LTV_TYPE	0x07
++#define BAP_METADATA_AUDIO_ACTIVE_STATE_LTV_TYPE	0x08
++#define BAP_METADATA_IMMEDIATE_RENDERING_LTV_TYPE	0x09
++#define BAP_METADATA_ASSISTED_LISTENING_LTV_TYPE	0x0a
++#define BAP_METADATA_BROADCAST_NAME_LTV_TYPE	0x0b
++#define BAP_METADATA_EXTENDED_LTV_TYPE		0xfe
++#define BAP_METADATA_VENDOR_LTV_TYPE		0xff
+ 
+ struct bt_bap_pac_changed {
+ 	unsigned int id;
+@@ -3423,6 +3432,14 @@
+ 	uint8_t err;
+ };
+ 
++static void bap_metadata_invalid(struct bap_metadata_process *data,
++						uint8_t type)
++{
++	ascs_ase_rsp_add(data->rsp, data->ep->id,
++			BT_ASCS_RSP_METADATA_INVALID, type);
++	data->err = BT_ASCS_RSP_METADATA_INVALID;
++}
++
+ static void bap_metadata_process(size_t i, uint8_t l, uint8_t t, uint8_t *v,
+ 					void *user_data)
+ {
+@@ -3431,25 +3448,55 @@
+ 
+ 	switch (t) {
+ 	case BAP_METADATA_PREF_CONTEXT_LTV_TYPE:
++		if (l != sizeof(context))
++			bap_metadata_invalid(data, t);
+ 		break;
+ 	case BAP_METADATA_CONTEXT_LTV_TYPE:
+ 		if (l != sizeof(context)) {
+-			ascs_ase_rsp_add(data->rsp, data->ep->id,
+-					BT_ASCS_RSP_METADATA_INVALID, t);
+-			data->err = BT_ASCS_RSP_METADATA_INVALID;
++			bap_metadata_invalid(data, t);
+ 			break;
+ 		}
+ 
+ 		context = get_le16(v);
+-		if (!context || (context & ~data->context)) {
+-			ascs_ase_rsp_add(data->rsp, data->ep->id,
+-					BT_ASCS_RSP_METADATA_INVALID, t);
+-			data->err = BT_ASCS_RSP_METADATA_INVALID;
+-		}
++		if (!context || (context & ~data->context))
++			bap_metadata_invalid(data, t);
+ 
+ 		break;
+ 	case BAP_METADATA_PROGRAM_INFO_LTV_TYPE:
++	case BAP_METADATA_PROGRAM_INFO_URI_LTV_TYPE:
++		break;
+ 	case BAP_METADATA_LANGUAGE_LTV_TYPE:
++		if (l != 3)
++			bap_metadata_invalid(data, t);
++		break;
++	case BAP_METADATA_CCID_LIST_LTV_TYPE:
++		if (!l)
++			bap_metadata_invalid(data, t);
++		break;
++	case BAP_METADATA_PARENTAL_RATING_LTV_TYPE:
++		if (l != 1)
++			bap_metadata_invalid(data, t);
++		break;
++	case BAP_METADATA_AUDIO_ACTIVE_STATE_LTV_TYPE:
++		if (l != 1 || v[0] > 1)
++			bap_metadata_invalid(data, t);
++		break;
++	case BAP_METADATA_IMMEDIATE_RENDERING_LTV_TYPE:
++		if (l)
++			bap_metadata_invalid(data, t);
++		break;
++	case BAP_METADATA_ASSISTED_LISTENING_LTV_TYPE:
++		if (l != 1 || v[0])
++			bap_metadata_invalid(data, t);
++		break;
++	case BAP_METADATA_BROADCAST_NAME_LTV_TYPE:
++		if (l < 4 || l > 128)
++			bap_metadata_invalid(data, t);
++		break;
++	case BAP_METADATA_EXTENDED_LTV_TYPE:
++	case BAP_METADATA_VENDOR_LTV_TYPE:
++		if (l < 2)
++			bap_metadata_invalid(data, t);
+ 		break;
+ 	default:
+ 		ascs_ase_rsp_add(data->rsp, data->ep->id,
+--- a/unit/test-bap.c
++++ b/unit/test-bap.c
+@@ -3692,6 +3692,46 @@
+ 	ENABLE_ASE(SRC_ID(0)), \
+ 	SRC_ENABLE_NOTIFY(0, 0)
+ 
++/* Exact Android conversational metadata: Context 0x0002, CCID List { 0x01 }. */
++#define ENABLE_ASE_CCID(id) \
++	IOV_DATA(ENABLE_PDU(1), id, 0x07, 0x03, 0x02, 0x02, 0x00, \
++			0x02, 0x05, 0x01), \
++	IOV_DATA(0x1b, CP_HND, 0x03, 0x01, id, 0x00, 0x00)
++
++#define SCC_SRC_ENABLE_CCID \
++	SCC_SRC_16_2_1, \
++	ENABLE_ASE_CCID(SRC_ID(0)), \
++	IOV_NULL, \
++	IOV_DATA(0x1b, SRC_HND(0), SRC_ID(0), 0x03, 0x00, 0x00, 0x07, \
++			0x03, 0x02, 0x02, 0x00, 0x02, 0x05, 0x01)
++
++/* Every Generic Audio Metadata type currently assigned by Bluetooth SIG. */
++#define ASSIGNED_METADATA \
++	0x03, 0x01, 0x01, 0x00, \
++	0x03, 0x02, 0x02, 0x00, \
++	0x02, 0x03, 0x78, \
++	0x04, 0x04, 0x65, 0x6e, 0x67, \
++	0x02, 0x05, 0x01, \
++	0x02, 0x06, 0x00, \
++	0x02, 0x07, 0x78, \
++	0x02, 0x08, 0x01, \
++	0x01, 0x09, \
++	0x02, 0x0a, 0x00, \
++	0x05, 0x0b, 0x74, 0x65, 0x73, 0x74, \
++	0x03, 0xfe, 0x01, 0x00, \
++	0x03, 0xff, 0x01, 0x00
++
++#define ENABLE_ASE_ASSIGNED_METADATA(id) \
++	IOV_DATA(ENABLE_PDU(1), id, 0x2f, ASSIGNED_METADATA), \
++	IOV_DATA(0x1b, CP_HND, 0x03, 0x01, id, 0x00, 0x00)
++
++#define SCC_SRC_ENABLE_ASSIGNED_METADATA \
++	SCC_SRC_16_2_1, \
++	ENABLE_ASE_ASSIGNED_METADATA(SRC_ID(0)), \
++	IOV_NULL, \
++	IOV_DATA(0x1b, SRC_HND(0), SRC_ID(0), 0x03, 0x00, 0x00, 0x2f, \
++			ASSIGNED_METADATA)
++
+ /* Test Purpose:
+  * Verify that a Unicast Client IUT can initiate an Enable operation for an ASE
+  * with a Unicast Server that is either in the Audio Sink role or the Audio
+@@ -3730,6 +3770,12 @@
+ 	define_test("BAP/USR/SCC/BV-136-C [UCL SRC Enable]",
+ 			test_setup_server, test_server, &cfg_src_enable,
+ 			SCC_SRC_ENABLE);
++	define_test("BAP/USR/SCC/CCID-01 [USR SRC Enable with CCID List]",
++			test_setup_server, test_server, &cfg_src_enable,
++			SCC_SRC_ENABLE_CCID);
++	define_test("BAP/USR/SCC/META-01 [USR SRC Enable assigned metadata]",
++			test_setup_server, test_server, &cfg_src_enable,
++			SCC_SRC_ENABLE_ASSIGNED_METADATA);
+ }
+ 
+ static void test_scc_enable(void)
+@@ -4408,8 +4454,8 @@
+ 
+ #define SPE_METADATA_UNSUPPORTED(_ase) \
+ 	SCC_SRC_ENABLE, \
+-	IOV_DATA(0x52, CP_HND, 0x07, 0x01, _ase, 0x02, 0x01, 0xfc), \
+-	ASE_CP_RSP(0x07, _ase, 0x0a, 0xfc)
++	IOV_DATA(0x52, CP_HND, 0x07, 0x01, _ase, 0x02, 0x01, 0x7f), \
++	ASE_CP_RSP(0x07, _ase, 0x0a, 0x7f)
+ 
+ #define SPE_METADATA_INVALID_CONTEXT(_ase) \
+ 	SCC_SRC_ENABLE, \
+@@ -4417,6 +4463,58 @@
+ 			0x00, 0x10), \
+ 	ASE_CP_RSP(0x07, _ase, 0x0c, 0x02)
+ 
++#define SPE_METADATA_EMPTY_CCID(_ase) \
++	SCC_SRC_ENABLE, \
++	IOV_DATA(0x52, CP_HND, 0x07, 0x01, _ase, 0x02, 0x01, 0x05), \
++	ASE_CP_RSP(0x07, _ase, 0x0c, 0x05)
++
++#define SPE_METADATA_SHORT_PREFERRED(_ase) \
++	SCC_SRC_ENABLE, \
++	IOV_DATA(0x52, CP_HND, 0x07, 0x01, _ase, 0x03, 0x02, 0x01, 0x01), \
++	ASE_CP_RSP(0x07, _ase, 0x0c, 0x01)
++
++#define SPE_METADATA_SHORT_LANGUAGE(_ase) \
++	SCC_SRC_ENABLE, \
++	IOV_DATA(0x52, CP_HND, 0x07, 0x01, _ase, 0x04, 0x03, 0x04, \
++			0x65, 0x6e), \
++	ASE_CP_RSP(0x07, _ase, 0x0c, 0x04)
++
++#define SPE_METADATA_EMPTY_PARENTAL(_ase) \
++	SCC_SRC_ENABLE, \
++	IOV_DATA(0x52, CP_HND, 0x07, 0x01, _ase, 0x02, 0x01, 0x06), \
++	ASE_CP_RSP(0x07, _ase, 0x0c, 0x06)
++
++#define SPE_METADATA_INVALID_ACTIVE_STATE(_ase) \
++	SCC_SRC_ENABLE, \
++	IOV_DATA(0x52, CP_HND, 0x07, 0x01, _ase, 0x03, 0x02, 0x08, 0x02), \
++	ASE_CP_RSP(0x07, _ase, 0x0c, 0x08)
++
++#define SPE_METADATA_NONEMPTY_RENDERING_FLAG(_ase) \
++	SCC_SRC_ENABLE, \
++	IOV_DATA(0x52, CP_HND, 0x07, 0x01, _ase, 0x03, 0x02, 0x09, 0x00), \
++	ASE_CP_RSP(0x07, _ase, 0x0c, 0x09)
++
++#define SPE_METADATA_INVALID_ASSISTED_LISTENING(_ase) \
++	SCC_SRC_ENABLE, \
++	IOV_DATA(0x52, CP_HND, 0x07, 0x01, _ase, 0x03, 0x02, 0x0a, 0x01), \
++	ASE_CP_RSP(0x07, _ase, 0x0c, 0x0a)
++
++#define SPE_METADATA_SHORT_BROADCAST_NAME(_ase) \
++	SCC_SRC_ENABLE, \
++	IOV_DATA(0x52, CP_HND, 0x07, 0x01, _ase, 0x05, 0x04, 0x0b, \
++			0x61, 0x62, 0x63), \
++	ASE_CP_RSP(0x07, _ase, 0x0c, 0x0b)
++
++#define SPE_METADATA_SHORT_EXTENDED(_ase) \
++	SCC_SRC_ENABLE, \
++	IOV_DATA(0x52, CP_HND, 0x07, 0x01, _ase, 0x03, 0x02, 0xfe, 0x01), \
++	ASE_CP_RSP(0x07, _ase, 0x0c, 0xfe)
++
++#define SPE_METADATA_SHORT_VENDOR(_ase) \
++	SCC_SRC_ENABLE, \
++	IOV_DATA(0x52, CP_HND, 0x07, 0x01, _ase, 0x03, 0x02, 0xff, 0x01), \
++	ASE_CP_RSP(0x07, _ase, 0x0c, 0xff)
++
+ /* Unicast Server Rejects Invalid ASE Control Point Procedures
+  *
+  * Test Purpose:
+@@ -4444,6 +4542,36 @@
+ 	define_test("BAP/USR/SPE/BI-05-C [USR Update Metadata invalid context]",
+ 			test_setup_server, test_server, &cfg_src_enable,
+ 			SPE_METADATA_INVALID_CONTEXT(SRC_ID(0)));
++	define_test("BAP/USR/SPE/CCID-02 [USR Update Metadata empty CCID]",
++			test_setup_server, test_server, &cfg_src_enable,
++			SPE_METADATA_EMPTY_CCID(SRC_ID(0)));
++	define_test("BAP/USR/SPE/META-02 [USR Update Metadata short preferred]",
++			test_setup_server, test_server, &cfg_src_enable,
++			SPE_METADATA_SHORT_PREFERRED(SRC_ID(0)));
++	define_test("BAP/USR/SPE/META-03 [USR Update Metadata short language]",
++			test_setup_server, test_server, &cfg_src_enable,
++			SPE_METADATA_SHORT_LANGUAGE(SRC_ID(0)));
++	define_test("BAP/USR/SPE/META-04 [USR Update Metadata empty parental]",
++			test_setup_server, test_server, &cfg_src_enable,
++			SPE_METADATA_EMPTY_PARENTAL(SRC_ID(0)));
++	define_test("BAP/USR/SPE/META-05 [USR Update Metadata invalid active]",
++			test_setup_server, test_server, &cfg_src_enable,
++			SPE_METADATA_INVALID_ACTIVE_STATE(SRC_ID(0)));
++	define_test("BAP/USR/SPE/META-06 [USR Update Metadata rendering value]",
++			test_setup_server, test_server, &cfg_src_enable,
++			SPE_METADATA_NONEMPTY_RENDERING_FLAG(SRC_ID(0)));
++	define_test("BAP/USR/SPE/META-07 [USR Update Metadata invalid assisted]",
++			test_setup_server, test_server, &cfg_src_enable,
++			SPE_METADATA_INVALID_ASSISTED_LISTENING(SRC_ID(0)));
++	define_test("BAP/USR/SPE/META-08 [USR Update Metadata short name]",
++			test_setup_server, test_server, &cfg_src_enable,
++			SPE_METADATA_SHORT_BROADCAST_NAME(SRC_ID(0)));
++	define_test("BAP/USR/SPE/META-09 [USR Update Metadata short extended]",
++			test_setup_server, test_server, &cfg_src_enable,
++			SPE_METADATA_SHORT_EXTENDED(SRC_ID(0)));
++	define_test("BAP/USR/SPE/META-10 [USR Update Metadata short vendor]",
++			test_setup_server, test_server, &cfg_src_enable,
++			SPE_METADATA_SHORT_VENDOR(SRC_ID(0)));
+ }
+ 
+ static void test_spe(void)
+-- 
+2.47.2

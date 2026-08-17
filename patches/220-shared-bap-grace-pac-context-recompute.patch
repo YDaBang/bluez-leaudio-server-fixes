@@ -1,0 +1,166 @@
+From: YDaBang <y_dabang@protonmail.com>
+Date: Sun, 16 Aug 2026 05:00:00 +0900
+Subject: [PATCH] shared/bap: grace external PAC owner restarts
+
+An external MediaEndpoint owner can disappear and return during a short
+process restart. Recomputing the Sink PAC aggregate immediately on owner loss
+publishes a transient unavailable context even though the replacement PACs
+arrive about one second later. Android can cache that transient value and stop
+subscribing to the PACS context characteristics.
+
+Keep the last published aggregate for a bounded five-second grace period.
+When the grace expires, recompute Sink and Source location and context values
+from the complete current PAC queues and publish one combined Supported and
+Available Audio Context notification. A quick owner restart therefore never
+publishes the transient zero, while a real permanent removal still becomes
+visible after the bound.
+
+This is deliberately limited to local unicast PAC aggregate lifetime. Stream
+release, PAC callbacks, codec lists, broadcast PACs, and call disposition are
+unchanged.
+---
+ src/shared/bap.c | 90 ++++++++++++++++++++++++++++++++++++++++-----------------
+ 1 file changed, 61 insertions(+), 29 deletions(-)
+
+
+Signed-off-by: YDaBang <y_dabang@protonmail.com>
+
+diff --git a/src/shared/bap.c b/src/shared/bap.c
+--- a/src/shared/bap.c
++++ b/src/shared/bap.c
+@@ -33,6 +33,8 @@
+ #include "src/shared/ascs.h"
+ #include "src/shared/bap-debug.h"
+ 
++#define PACS_RECOMPUTE_GRACE_SECONDS 5
++
+ /* Maximum number of ASE(s) */
+ #define NUM_SINKS 2
+ #define NUM_SOURCE 2
+@@ -153,6 +155,7 @@ struct bt_bap_db {
+ 	struct queue *sources;
+ 	struct queue *broadcast_sources;
+ 	struct queue *broadcast_sinks;
++	unsigned int pacs_recompute_id;
+ };
+ 
+ struct bt_bap_req {
+@@ -4498,51 +4501,78 @@ static void remove_lpac_streams(void *data, void *user_data)
+ 	}
+ }
+ 
+-static void bap_pac_sink_removed(void *data, void *user_data)
++static void bap_pac_qos_merge(void *data, void *user_data)
+ {
+ 	struct bt_bap_pac *pac = data;
+ 	struct bt_bap_pac_qos *qos = user_data;
+ 
+ 	qos->location |= pac->qos.location;
+ 	qos->supported_context |= pac->qos.supported_context;
+ 	qos->context |= pac->qos.context;
+ }
+ 
+-bool bt_bap_remove_pac(struct bt_bap_pac *pac)
++static bool bap_pacs_recompute(void *data)
+ {
+-	if (!pac)
+-		return false;
++	struct bt_bap_db *bdb = data;
++	struct bt_pacs *pacs = bdb->pacs;
++	struct bt_bap_pac_qos sink;
++	struct bt_bap_pac_qos source;
++
++	bdb->pacs_recompute_id = 0;
++
++	memset(&sink, 0, sizeof(sink));
++	memset(&source, 0, sizeof(source));
++	queue_foreach(bdb->sinks, bap_pac_qos_merge, &sink);
++	queue_foreach(bdb->sources, bap_pac_qos_merge, &source);
++
++	if (pacs->sink_loc_value != sink.location) {
++		pacs->sink_loc_value = sink.location;
++		pacs_sink_location_changed(pacs);
++	}
++
++	if (pacs->source_loc_value != source.location) {
++		pacs->source_loc_value = source.location;
++		pacs_source_location_changed(pacs);
++	}
++
++	/* Update both halves before publishing the combined characteristic. */
++	pacs->supported_sink_context_value = sink.supported_context;
++	pacs->supported_source_context_value = source.supported_context;
++	pacs_supported_context_changed(pacs);
++
++	pacs->sink_context_value = sink.context;
++	pacs->source_context_value = source.context;
++	pacs_context_changed(pacs);
++
++	return false;
++}
++
++static void bap_pacs_schedule_recompute(struct bt_bap_db *bdb)
++{
++	if (bdb->pacs_recompute_id)
++		timeout_remove(bdb->pacs_recompute_id);
++
++	bdb->pacs_recompute_id = timeout_add_seconds(
++					PACS_RECOMPUTE_GRACE_SECONDS,
++					bap_pacs_recompute, bdb, NULL);
++	if (!bdb->pacs_recompute_id)
++		bap_pacs_recompute(bdb);
++}
++
++bool bt_bap_remove_pac(struct bt_bap_pac *pac)
++{
++	if (!pac)
++		return false;
+ 
+ 	if (queue_remove_if(pac->bdb->sinks, NULL, pac)) {
+-		struct bt_pacs *pacs = pac->bdb->pacs;
+-		struct bt_bap_pac_qos qos;
+-
+-		memset(&qos, 0, sizeof(qos));
+-		queue_foreach(pac->bdb->sinks, bap_pac_sink_removed, &qos);
+-
+-		if (pacs->sink_loc_value != qos.location) {
+-			pacs->sink_loc_value = qos.location;
+-			pacs_sink_location_changed(pacs);
+-		}
+-
+-		if (pacs->supported_sink_context_value !=
+-				qos.supported_context) {
+-			pacs->supported_sink_context_value =
+-							qos.supported_context;
+-			pacs_supported_context_changed(pacs);
+-		}
+-
+-		if (pacs->sink_context_value != qos.context) {
+-			pacs->sink_context_value = qos.context;
+-			pacs_context_changed(pacs);
+-		}
+-
+-
++		bap_pacs_schedule_recompute(pac->bdb);
+ 		goto found;
+ 	}
+ 
+-	if (queue_remove_if(pac->bdb->sources, NULL, pac))
++	if (queue_remove_if(pac->bdb->sources, NULL, pac)) {
++		bap_pacs_schedule_recompute(pac->bdb);
+ 		goto found;
++	}
+ 
+ 	if (queue_remove_if(pac->bdb->broadcast_sources, NULL, pac))
+ 		goto found;
+@@ -4565,6 +4595,8 @@ static void bap_db_free(void *data)
+ 	if (!bdb)
+ 		return;
+ 
++	timeout_remove(bdb->pacs_recompute_id);
++
+ 	queue_destroy(bdb->sinks, bap_pac_free);
+ 	queue_destroy(bdb->sources, bap_pac_free);
+ 	gatt_db_unref(bdb->db);
+-- 
+2.47.2

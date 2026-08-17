@@ -1,0 +1,169 @@
+From: YDaBang <y_dabang@protonmail.com>
+Date: Sun, 16 Aug 2026 06:20:00 +0900
+Subject: [PATCH] profiles/audio: preserve profile services across owner restart
+
+When the last external MediaEndpoint disappears, update_features immediately
+clears the TMAP role. That deactivates TMAS and the local singleton CAS, emits
+Service Changed, and makes a connected Android client discard its LE Audio
+active group while it rediscovers the whole GATT database. A replacement
+endpoint from the restarted owner arrives less than a second later, but the
+service identity and client subscriptions have already been disturbed.
+
+Defer only the transition from a nonzero aggregate feature set to zero for a
+bounded five-second grace period. A replacement endpoint cancels the pending
+transition and leaves TMAS, CAS, and their handles unchanged. A real permanent
+endpoint removal still clears the roles at grace expiry. Nonzero role changes
+remain immediate, and adapter teardown cancels the pending callback.
+---
+ profiles/audio/media.c | 74 ++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 66 insertions(+), 8 deletions(-)
+
+
+Signed-off-by: YDaBang <y_dabang@protonmail.com>
+
+diff --git a/profiles/audio/media.c b/profiles/audio/media.c
+--- a/profiles/audio/media.c
++++ b/profiles/audio/media.c
+@@ -52,6 +52,7 @@
+ #include "src/shared/asha.h"
+ #include "src/shared/util.h"
+ #include "src/shared/queue.h"
++#include "src/shared/timeout.h"
+ #include "src/shared/att.h"
+ #include "src/shared/bap.h"
+ #include "src/shared/bap-debug.h"
+@@ -77,6 +78,9 @@
+ /* Timeout should be less than ATT timeout (30 seconds) */
+ #define BAP_REQUEST_TIMEOUT_MSEC	(3 * 1000)
+ 
++/* Keep local profile services stable across a bounded endpoint owner restart. */
++#define MEDIA_FEATURE_RECOMPUTE_GRACE_SECONDS	5
++
+ struct media_app {
+ 	struct media_adapter	*adapter;
+ 	GDBusClient		*client;
+@@ -95,6 +99,7 @@
+ 	GSList			*endpoints;	/* Endpoints list */
+ 	GSList			*players;	/* Players list */
+ 	int			so_timestamping;
++	unsigned int		feature_recompute_id;
+ };
+ 
+ struct endpoint_request {
+@@ -268,31 +273,92 @@
+ 	return NULL;
+ }
+ 
+-static void update_features(struct media_adapter *adapter)
++static void collect_features(struct media_adapter *adapter,
++					struct endpoint_features *all)
+ {
+-	struct endpoint_features all = { 0 };
+ 	GSList *list;
++
++	memset(all, 0, sizeof(*all));
++
++	for (list = adapter->endpoints; list; list = list->next) {
++		struct media_endpoint *endpoint = list->data;
++
++		all->tmap_role |= endpoint->features.tmap_role;
++		all->gmap_role |= endpoint->features.gmap_role;
++		all->gmap_features |= endpoint->features.gmap_features;
++	}
++}
++
++static void apply_features(struct media_adapter *adapter,
++					struct endpoint_features *all)
++{
+ 	struct btd_gatt_database *database;
+ 	struct gatt_db *db;
+ 	struct bt_tmap *tmap;
+ 	struct bt_gmap *gmap;
+ 
+-	for (list = adapter->endpoints; list; list = list->next) {
+-		struct media_endpoint *endpoint = list->data;
+-
+-		all.tmap_role |= endpoint->features.tmap_role;
+-		all.gmap_role |= endpoint->features.gmap_role;
+-		all.gmap_features |= endpoint->features.gmap_features;
+-	}
+-
+ 	database = btd_adapter_get_database(adapter->btd_adapter);
+ 	db = btd_gatt_database_get_db(database);
+ 	tmap = bt_tmap_find(db);
+ 	gmap = bt_gmap_find(db);
+ 
+-	bt_tmap_set_role(tmap, all.tmap_role);
+-	bt_gmap_set_role(gmap, all.gmap_role);
+-	bt_gmap_set_features(gmap, all.gmap_features);
++	bt_tmap_set_role(tmap, all->tmap_role);
++	bt_gmap_set_role(gmap, all->gmap_role);
++	bt_gmap_set_features(gmap, all->gmap_features);
++}
++
++static bool features_active(struct media_adapter *adapter)
++{
++	struct btd_gatt_database *database;
++	struct gatt_db *db;
++	struct bt_tmap *tmap;
++	struct bt_gmap *gmap;
++
++	database = btd_adapter_get_database(adapter->btd_adapter);
++	db = btd_gatt_database_get_db(database);
++	tmap = bt_tmap_find(db);
++	gmap = bt_gmap_find(db);
++
++	return bt_tmap_get_role(tmap) || bt_gmap_get_role(gmap) ||
++						bt_gmap_get_features(gmap);
++}
++
++static bool feature_recompute_timeout(void *data)
++{
++	struct media_adapter *adapter = data;
++	struct endpoint_features all;
++
++	adapter->feature_recompute_id = 0;
++	collect_features(adapter, &all);
++	apply_features(adapter, &all);
++
++	return false;
++}
++
++static void update_features(struct media_adapter *adapter)
++{
++	struct endpoint_features all;
++
++	collect_features(adapter, &all);
++
++	if (!all.tmap_role && !all.gmap_role && !all.gmap_features &&
++						features_active(adapter)) {
++		if (adapter->feature_recompute_id)
++			return;
++
++		adapter->feature_recompute_id = timeout_add_seconds(
++				MEDIA_FEATURE_RECOMPUTE_GRACE_SECONDS,
++				feature_recompute_timeout, adapter, NULL);
++		if (adapter->feature_recompute_id)
++			return;
++	}
++
++	if (adapter->feature_recompute_id) {
++		timeout_remove(adapter->feature_recompute_id);
++		adapter->feature_recompute_id = 0;
++	}
++
++	apply_features(adapter, &all);
+ }
+ 
+ static void media_endpoint_remove(void *data)
+@@ -3688,6 +3754,8 @@
+ 		local_player_destroy(mp);
+ 	}
+ 
++	timeout_remove(adapter->feature_recompute_id);
++
+ 	adapters = g_slist_remove(adapters, adapter);
+ 
+ 	btd_adapter_unref(adapter->btd_adapter);
+-- 
+2.47.2
