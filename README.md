@@ -10,6 +10,14 @@ The acceptor path is less travelled, and these are places where it does not hold
 up.  Each patch is described below with the symptom that led to it, why it
 happens, and how to reproduce it.
 
+What sat on top of BlueZ while these were found is
+[asterisk-chan-mobile-leaudio][chan], an LE Audio unicast transport for
+Asterisk's `chan_mobile`.  That is where the symptoms were first visible — a call
+that connects with no audio and no error — and it is the other half of the
+reproduction for 223.
+
+[chan]: https://github.com/YDaBang/asterisk-chan-mobile-leaudio
+
 ## The patches
 
 | # | Area | What it fixes |

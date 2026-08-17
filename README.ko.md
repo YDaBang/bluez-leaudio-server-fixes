@@ -8,6 +8,13 @@ acceptor 경로는 상대적으로 덜 쓰이고, 아래는 그 경로가 버티
 입니다. 각 패치마다 어떤 증상에서 출발했는지, 왜 생기는지, 어떻게 재현하는지를
 적었습니다.
 
+이 패치들을 찾을 때 BlueZ 위에 올라가 있던 것은
+[asterisk-chan-mobile-leaudio][chan]입니다. Asterisk `chan_mobile`용 LE Audio
+유니캐스트 전송 계층인데, 증상이 처음 드러난 곳이 거기입니다 — 통화는 연결되고
+오디오는 없고 에러도 없는 상태. 223 재현의 나머지 절반이기도 합니다.
+
+[chan]: https://github.com/YDaBang/asterisk-chan-mobile-leaudio
+
 *English version: [README.md](README.md)*
 
 ## 패치 목록
