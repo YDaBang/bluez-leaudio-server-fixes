@@ -4,6 +4,8 @@ Four patches against BlueZ 5.87, found while running BlueZ as the **acceptor**
 side of a LE Audio unicast link — a router acting as the audio sink/source for a
 phone, rather than the usual initiator role of a headset stack.
 
+*한국어: [README.ko.md](README.ko.md)*
+
 The acceptor path is less travelled, and these are places where it does not hold
 up.  Each patch is described below with the symptom that led to it, why it
 happens, and how to reproduce it.
