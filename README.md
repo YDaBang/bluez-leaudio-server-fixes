@@ -141,10 +141,12 @@ If you only want 223, it applies to a bare 5.87 tree on its own.
 
 ## Status
 
-Not yet submitted upstream.  These are published here so the analysis and the
-reproduction are available; the intent is to send 223 to
-`linux-bluetooth@vger.kernel.org` on its own first, since it carries a failing
-test and stands by itself.
+Not submitted upstream, and there are no plans to.  These are published here so
+the analysis and the reproduction are available to anyone who needs them.
+
+If you want any of this on `linux-bluetooth`, take it.  No attribution is
+required and no permission is needed — 223 in particular stands by itself and
+carries a test that fails without it, so it should be straightforward to send.
 
 ## License
 
